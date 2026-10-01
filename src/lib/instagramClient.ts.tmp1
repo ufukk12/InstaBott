@@ -1,0 +1,804 @@
+"use client";
+
+// İstemci Orkestratörü — Optimize Edilmiş
+// Python'daki main() akışının TypeScript karşılığı:
+//   1. get_user_id → profil bilgisi al
+//   2. fetch_followers → tüm takipçileri çek (sayfalı)
+//   3. fetch_following → tüm takip edilenleri çek (sayfalı)
+//   4. compare_follow_lists → Hash Map analizi
+//
+// Optimizasyonlar:
+//   • callPageApi/callLikersApi → generic callPaginatedApi (DRY)
+//   • fetchWithPagination/fetchLikersWithPagination → generic runPaginationLoop (DRY)
+//   • fetchWithDeficitRetry/fetchLikersWithDeficitRetry → generic runDeficitRetry (DRY)
+//   • AbortController + 18s timeout (Aşama 2)
+//   • Exponential Backoff + Retry-After (Aşama 2)
+//   • Checkpoint — her sayfada cursor+veri kaydı (Aşama 3)
+//   • Analysis Lock — paralel tetikleme engeli (Aşama 4)
+//   • Map tabanlı inline dedup + Jitter gecikme (Equilibrium Aşama 1)
+//   • Denge Kontrolü (Equilibrium Check) ile akıllı durdurma (Equilibrium Aşama 2)
+
+import type { IgUser } from "@/lib/instagramApi";
+import { MAX_SERVER_REQUEST_DURATION_MS, PAGE_SIZE } from "@/lib/instagramApi";
+import { toSafeId } from "@/lib/ids";
+import { runFullAnalysis, runGhostAnalysis } from "@/lib/instagramAnalysis";
+import {
+  saveAnalysisPayloadBatch,
+  loadAnalysisPayload,
+  saveCheckpoint,
+  loadCheckpoint,
+  clearCheckpoint,
+  acquireAnalysisLock,
+  releaseAnalysisLock,
+} from "@/lib/idb";
+
+// ─── Sabitler ─────────────────────────────────────────────────────────────────
+
+// Python'daki REQUEST_DELAY_SEC = 1.5'in randomize versiyonu + Jitter
+const DELAY_MIN_MS = 3500;
+const DELAY_MAX_MS = 6000; // Equilibrium Aşama 1: Jitter — 3.5s ile 6s arası rastgele gecikme
+const MAX_RATE_LIMIT_RETRIES = 10;
+const MAX_DEFICIT_RETRIES = 5; // Equilibrium Aşama 3: mutlak retry limiti
+// DÜZELTME: Sabit 18s yerine sunucunun (instagramApi.ts → igRequest) olası en kötü
+// senaryo süresinden türetiliyor (+ güvenlik payı). Sabit 18s bırakılsaydı, sunucu
+// kendi içinde 2 kez retry ederken (~57s'ye kadar sürebilir) client bundan çok daha
+// önce "NETWORK" hatasıyla pes edip sunucu hâlâ çalışırken gereksiz yere iptal ederdi.
+const CLIENT_TIMEOUT_MS = MAX_SERVER_REQUEST_DURATION_MS + 5_000; // 5sn güvenlik payı
+const CHECKPOINT_SAVE_EVERY = 3; // Her N sayfada bir checkpoint kaydet (IDB yazım maliyetini azaltır)
+// Büyük Hesap Ölçeklendirmesi ─────────────────────────────────────────────────
+// TARGET_CHECKPOINT_COUNT: bir taramanın tamamı boyunca yapılacak checkpoint yazımı
+// sayısının üst sınırı. CHECKPOINT_SAVE_EVERY sabit kalsaydı, checkpoint her seferinde
+// TÜM birikmiş listeyi yeniden yazdığından (idb.ts → saveCheckpoint), toplam yazılan byte
+// hacmi sayfa sayısının KARESİYLE büyürdü (200 takipçide önemsiz, 500.000 takipçide —
+// binlerce sayfa— checkpoint başına yazılan veri de arttıkça toplamda ikinci dereceden
+// bir maliyete dönüşür). Aralığı beklenen sayfa sayısına göre ölçekleyerek toplam
+// checkpoint sayısını hesap büyüklüğünden bağımsız, sabit bir üst sınırda tutuyoruz.
+const TARGET_CHECKPOINT_COUNT = 25;
+// LARGE_ACCOUNT_THRESHOLD: bu eşiğin üzerindeki hesaplarda tek bir tam sayfalama turu
+// zaten dakikalar/saatler sürer. expectedCount, taramanın BAŞINDA alınan anlık bir
+// görüntüdür (profil sayacı); saatler süren bir taramanın sonunda bu sayı organik
+// takip/takipten-çıkma trafiği yüzünden zaten eskimiş/hareketli bir hedefe dönüşür.
+// 5 tam turu bu hedefe yakınsamayı ummak için tekrarlamak yakınsamaz — sadece süreyi
+// katlar. Büyük hesaplarda retry bütçesini düşürmek, küçük hesaplardaki davranışı
+// (5 deneme + Denge Kontrolü) HİÇ değiştirmeden sadece bu rejime özel bir ayar.
+const LARGE_ACCOUNT_THRESHOLD = 5_000;
+const MAX_DEFICIT_RETRIES_LARGE_ACCOUNT = 1;
+const CLIENT_NETWORK_RETRY_MAX = 3; // Client↔kendi sunucusu arası geçici kopmalar için
+const CLIENT_NETWORK_RETRY_DELAY_MS = 2_000;
+
+// ─── Tip Tanımları ────────────────────────────────────────────────────────────
+
+export type AnalysisProgress = {
+  step: string;
+  message: string;
+  current?: number;
+  total?: number;
+  cooldownSeconds?: number;
+};
+
+export type StoredAnalysis = {
+  followers: IgUser[];
+  following: IgUser[];
+  notFollowers: IgUser[];
+  unfollowing: IgUser[];
+  lastAnalysisAt: string | null;
+  profileStats: {
+    followersCount: number;
+    followingCount: number;
+    expectedFollowers: number;
+    expectedFollowing: number;
+  } | null;
+};
+
+// ─── Yardımcı Fonksiyonlar ────────────────────────────────────────────────────
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Opt-5: DELAY_RANGE sabite alındı — her çağrıda yeniden hesaplanmıyor
+const DELAY_RANGE = DELAY_MAX_MS - DELAY_MIN_MS + 1;
+const humanDelay = () =>
+  sleep(Math.floor(Math.random() * DELAY_RANGE) + DELAY_MIN_MS);
+
+// ─── Rate Limit Hatası (retryAfter'ı taşıyan özel Error tipi) ────────────────
+// Sunucu Retry-After header'ını okuyup buraya kadar taşıyabilsin diye (bkz. instagramApi.ts
+// → igRequest). error.message === "RATE_LIMIT" ile eski kontroller hâlâ çalışır çünkü
+// message alanı yine "RATE_LIMIT" olarak set ediliyor.
+class RateLimitError extends Error {
+  retryAfter: number | null;
+  constructor(retryAfter: number | null) {
+    super("RATE_LIMIT");
+    this.name = "RateLimitError";
+    this.retryAfter = retryAfter;
+  }
+}
+
+// ─── Generic Paginated API Call (DRY — callPageApi + callLikersApi birleşimi) ─
+
+async function callPaginatedApi(
+  endpoint: string,
+  body: Record<string, unknown>
+): Promise<{ users: IgUser[]; nextMaxId: string | null }> {
+  // Opt-2: clearTimeout sadece finally'de — catch içindeki fazla çağrı kaldırıldı
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
+
+  let res: Response;
+  try {
+    res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch {
+    // AbortError (timeout) veya ağ hatası — retry edilebilir
+    throw new Error("NETWORK");
+  } finally {
+    // finally her zaman çalışır — tek clearTimeout yeterli
+    clearTimeout(timeoutId);
+  }
+
+  const data = await res.json().catch(() => ({}));
+
+  if (res.status === 429 || data.code === "RATE_LIMIT") {
+    // Route handler'ınız Retry-After'ı gövdeye eklerse (bkz. altta not) burada okunur;
+    // eklemezse retryAfter null kalır ve runSmartCooldown otomatik exponential backoff'a düşer.
+    const retryAfter = typeof data.retryAfter === "number" ? data.retryAfter : null;
+    throw new RateLimitError(retryAfter);
+  }
+  if (res.status === 401 || data.code === "INVALID_SESSION") {
+    throw new Error("SESSION_INVALID");
+  }
+  if (!res.ok) {
+    // NETWORK hatası olarak işaretle — runPaginationLoop retry edebilir
+    throw new Error(data.code === "NETWORK" ? "NETWORK" : (data.error ?? `HTTP_${res.status}`));
+  }
+
+  return {
+    users: Array.isArray(data.users) ? data.users : [],
+    nextMaxId: data.nextMaxId != null ? String(data.nextMaxId) : null,
+  };
+}
+
+// ─── Smart Cooldown (Aşama 2 — Retry-After + Exponential Backoff) ─────────────
+// Sabit 60s yerine akıllı bekleme:
+//   1. Retry-After header varsa → o kadar bekle (maks 120s)
+//   2. Yoksa → Exponential Backoff: 4s, 8s, 16s, 32s, 60s cap
+//   3. Her saniye kullanıcıya kalan süre gösterilir
+
+async function runSmartCooldown(
+  attempt: number,
+  onProgress: ((p: AnalysisProgress) => void) | undefined,
+  current: number,
+  total: number,
+  retryAfterSeconds?: number | null
+) {
+  // Sunucudan gerçek Retry-After geldiyse onu kullan (maks 120s); gelmediyse Exponential Backoff
+  const waitSeconds =
+    retryAfterSeconds != null && retryAfterSeconds > 0
+      ? Math.min(retryAfterSeconds, 120)
+      : Math.ceil(Math.min(4 * Math.pow(2, attempt - 1), 60));
+
+  for (let remaining = waitSeconds; remaining > 0; remaining--) {
+    onProgress?.({
+      step: "cooldown",
+      message: `Instagram sunucuları dinlendiriliyor, lütfen bekleyin... (${remaining} saniye)`,
+      cooldownSeconds: remaining,
+      current,
+      total,
+    });
+    await sleep(1000);
+  }
+}
+
+// ─── Generic Pagination Loop (Map tabanlı inline dedup + Checkpoint) ──────────
+// Kümülatif Ekleme: Dışarıdan verilen Map'e ekler, asla sıfırlamaz.
+// while(true) döngüsü, humanDelay, rate-limit retry mantığı birebir korunuyor.
+
+async function runPaginationLoop(opts: {
+  fetchPage: (maxId: string | null) => Promise<{ users: IgUser[]; nextMaxId: string | null }>;
+  totalCount: number;
+  label: string;
+  checkpointKey: string;
+  cumulativeMap?: Map<string, IgUser>;
+  onProgress?: (p: AnalysisProgress) => void;
+}): Promise<{ users: IgUser[]; pageCursors: (string | null)[]; errorZoneMaxId: string | null }> {
+  const { fetchPage, totalCount, label, checkpointKey, onProgress } = opts;
+
+  // Checkpoint'ten devam et (varsa)
+  const checkpoint = await loadCheckpoint(checkpointKey);
+
+  // Kümülatif Map: Dışarıdan geldiyse onu kullan (No Wipe — asla sıfırlanmaz),
+  // gelmediyse yeni bir Map oluştur (ilk tur veya bağımsız kullanım).
+  const userMap = opts.cumulativeMap ?? new Map<string, IgUser>();
+
+  // Checkpoint'teki verileri de Map'e kümülatif ekle (zaten varsa dokunma)
+  if (checkpoint?.users) {
+    for (const u of checkpoint.users) {
+      const id = toSafeId(u);
+      if (id && !userMap.has(id)) userMap.set(id, u);
+    }
+  }
+
+  let nextMaxId: string | null = checkpoint?.nextMaxId ?? null;
+  let isFirstPage = checkpoint == null;
+  let skipNextDelay = checkpoint != null;
+  let rateLimitRetries = 0;
+  let networkRetries = 0;
+  let pageCount = 0;
+  const pageCursors: (string | null)[] = [nextMaxId];
+  let errorZoneMaxId: string | null = null;
+
+  // Büyük Hesap Ölçeklendirmesi: checkpoint sıklığını beklenen toplam sayfa sayısına göre
+  // ölçekle — küçük hesaplarda CHECKPOINT_SAVE_EVERY (3) sabit kalır, büyük hesaplarda
+  // toplam checkpoint sayısı ~TARGET_CHECKPOINT_COUNT'ta sabitlenir (bkz. sabit tanımı).
+  // Sonucu ASLA etkilemez — sadece ara kayıt sıklığını değiştirir.
+  const estimatedTotalPages = totalCount > 0 ? Math.ceil(totalCount / PAGE_SIZE) : 0;
+  const checkpointEvery =
+    estimatedTotalPages > TARGET_CHECKPOINT_COUNT
+      ? Math.ceil(estimatedTotalPages / TARGET_CHECKPOINT_COUNT)
+      : CHECKPOINT_SAVE_EVERY;
+
+  if (checkpoint) {
+    onProgress?.({
+      step: "fetching",
+      message: `${label} listesi kaldığı yerden devam ediyor... (${userMap.size}/${totalCount || "?"} hesap)`,
+      current: userMap.size,
+      total: totalCount,
+    });
+  }
+
+  // Python'daki while True döngüsünün karşılığı
+  while (true) {
+    // Jitter gecikme: 1.5s — 3.5s arası rastgele
+    if (!skipNextDelay && !isFirstPage) await humanDelay();
+    skipNextDelay = false;
+    isFirstPage = false;
+
+    try {
+      const page = await fetchPage(nextMaxId);
+
+      // Python'daki: if page.users is empty → break
+      if (page.users.length === 0) break;
+
+      // Kümülatif Ekleme: Map'e ekle — zaten varsa O(1) geç, yoksa ekle
+      for (const user of page.users) {
+        const id = toSafeId(user);
+        if (id && !userMap.has(id)) {
+          userMap.set(id, user);
+        }
+      }
+      rateLimitRetries = 0;
+      networkRetries = 0;
+      pageCount++;
+
+      onProgress?.({
+        step: "fetching",
+        message: `${label} taranıyor... (${userMap.size}/${totalCount || "?"} hesap bulundu)`,
+        current: userMap.size,
+        total: totalCount,
+      });
+
+      // Akıllı Erken Çıkış: Map boyutu beklenen sayıya ulaştıysa sayfalamayı bitir
+      // Opt-3: Checkpoint kaydı kaldırıldı — çıkışta clearCheckpoint zaten çağrılıyor
+      if (totalCount > 0 && userMap.size >= totalCount) break;
+
+      // Python'daki: max_id = data.get("next_max_id"); if not max_id: break
+      nextMaxId = page.nextMaxId;
+      if (nextMaxId) {
+        pageCursors.push(nextMaxId);
+      }
+
+      // Checkpoint throttle: her CHECKPOINT_SAVE_EVERY sayfada bir kaydet (son sayfa hariç).
+      // DÜZELTME: eskiden `|| !nextMaxId` son sayfada da kaydediyordu — yorumdaki niyetin
+      // ("son sayfa hariç") tam tersi. Sonuç: her başarılı çalışmada 1 gereksiz IDB yaz+sil
+      // çifti (aşağıdaki clearCheckpoint hemen ardından zaten temizliyordu). nextMaxId artık
+      // koşula dahil edilerek sadece "devam edilecek sayfa varken" kaydediliyor.
+      if (nextMaxId && pageCount % checkpointEvery === 0) {
+        const currentUsers = Array.from(userMap.values());
+        await saveCheckpoint(checkpointKey, { users: currentUsers, nextMaxId });
+      }
+
+      if (!nextMaxId) break;
+    } catch (error) {
+      if (error instanceof RateLimitError) {
+        rateLimitRetries++;
+        if (rateLimitRetries > MAX_RATE_LIMIT_RETRIES) {
+          throw new Error(`${label}: Hız sınırı aşıldı. ${userMap.size} kişi çekildi.`);
+        }
+        await runSmartCooldown(rateLimitRetries, onProgress, userMap.size, totalCount, error.retryAfter);
+        skipNextDelay = true;
+        continue;
+      }
+
+      // DÜZELTME: client↔kendi sunucusu arası geçici ağ kopmaları (wifi blip, vb.) artık
+      // hemen tüm akışı çökertmek yerine birkaç kez sessizce yeniden deneniyor. Sunucu
+      // tarafındaki igRequest zaten Instagram'a giden isteği kendi içinde retry ediyor;
+      // bu katman client'ın kendi sunucusuna ulaşamadığı ayrı durumu kapsıyor.
+      if (
+        error instanceof Error &&
+        error.message === "NETWORK" &&
+        networkRetries < CLIENT_NETWORK_RETRY_MAX
+      ) {
+        networkRetries++;
+        await sleep(CLIENT_NETWORK_RETRY_DELAY_MS * networkRetries);
+        skipNextDelay = true;
+        continue;
+      }
+
+      // Hata bölgesi (Error Zone) kaydı
+      errorZoneMaxId = nextMaxId;
+      
+      // Kalıcı hata (SESSION_INVALID vb.) veya ağ denemeleri tükendi — checkpoint kaydet ve çık
+      if (userMap.size > 0) {
+        await saveCheckpoint(checkpointKey, { users: Array.from(userMap.values()), nextMaxId });
+      }
+      throw error;
+    }
+  }
+
+  // Tamamlandı — checkpoint temizle
+  await clearCheckpoint(checkpointKey);
+
+  return {
+    users: Array.from(userMap.values()),
+    pageCursors,
+    errorZoneMaxId
+  };
+}
+
+// ─── Opt-6: mapToArr — Array.from(map.values()) tekrarını DRY'a çeken yardımcı ─
+const mapToArr = (m: Map<string, IgUser>): IgUser[] => Array.from(m.values());
+
+// ─── Kümülatif Deficit Retry (Hafızayı Koruyarak Akıllı Tamamlama) ──────────
+// Temel ilke: Bir kez çekilen veri ASLA silinmez (No Wipe).
+// Merkezi Map<string, IgUser> tüm turlar boyunca korunur.
+// Her yeni tur, aynı Map'e kümülatif ekleme yapar (O(1) has() kontrolü).
+// Map.size >= expectedCount olduğunda anında durur (Early Exit).
+// Jitter gecikme (2-5s) her sayfa arasında korunur (Anti-Ban).
+
+
+// ─── Smart Zone Scanning (Dinamik Kritik Nokta Taraması) ──────────────────────
+async function fetchSpecificZones(opts: {
+  fetchPage: (maxId: string | null) => Promise<{ users: IgUser[]; nextMaxId: string | null }>;
+  zoneCursors: (string | null)[];
+  userMap: Map<string, IgUser>;
+  label: string;
+  totalCount: number;
+  onProgress?: (p: AnalysisProgress) => void;
+}): Promise<void> {
+  const { fetchPage, zoneCursors, userMap, label, totalCount, onProgress } = opts;
+  
+  // Tekilleştirme için Set (Kursorler O(1) hızında işlenir)
+  const uniqueZones = Array.from(new Set(zoneCursors));
+
+  onProgress?.({
+    step: "repair",
+    message: `${label}: Akıllı Tarama başlatıldı (${uniqueZones.length} nokta)`,
+    current: userMap.size,
+    total: totalCount,
+  });
+
+  for (let i = 0; i < uniqueZones.length; i++) {
+    const maxId = uniqueZones[i];
+    let retries = 0;
+    const MAX_ZONE_RETRIES = 2; // Güvenlik Kuralı: Asla 5 defa zorlama
+
+    while (retries < MAX_ZONE_RETRIES) {
+      if (i > 0 || retries > 0) {
+        await humanDelay(); // Jitter gecikme (3.5 - 6 sn)
+      }
+
+      try {
+        const page = await fetchPage(maxId);
+        if (page.users.length > 0) {
+            for (const user of page.users) {
+                const id = toSafeId(user);
+                if (id && !userMap.has(id)) {
+                  userMap.set(id, user);
+                }
+            }
+        }
+        // Başarılıysa bir sonraki noktaya geç (retries döngüsünü kır)
+        break; 
+      } catch (error) {
+        retries++;
+        if (error instanceof RateLimitError) {
+          if (retries >= MAX_ZONE_RETRIES) {
+             console.warn(`[Smart Scan] Hız sınırı aşıldı (${maxId}). Bu nokta atlanıyor.`);
+             break;
+          }
+          await runSmartCooldown(retries, onProgress, userMap.size, totalCount, error.retryAfter);
+        } else if (error instanceof Error && error.message === "NETWORK") {
+          if (retries >= MAX_ZONE_RETRIES) {
+             console.warn(`[Smart Scan] Ağ hatası (${maxId}). Bu nokta atlanıyor.`);
+             break;
+          }
+        } else {
+          // Kalıcı veya kritik hata, es geçme fırlat
+          throw error;
+        }
+      }
+    }
+  }
+}
+
+async function runDeficitRetry(opts: {
+  fetchPage: (maxId: string | null) => Promise<{ users: IgUser[]; nextMaxId: string | null }>;
+  expectedCount: number;
+  label: string;
+  checkpointKey: string;
+  onProgress?: (p: AnalysisProgress) => void;
+}): Promise<IgUser[]> {
+  const { fetchPage, expectedCount, label, checkpointKey, onProgress } = opts;
+
+  // ═══ MERKEZ MAP — Tüm turlar boyunca ASLA sıfırlanmaz ═══
+  const masterMap = new Map<string, IgUser>();
+
+  // ─── Tur 1: İlk tam sayfalama ───────────────────────────────────────────
+  // Opt-1: firstBatch dönüş değeri kullanılmıyor — masterMap zaten dolu gelir.
+  // runPaginationLoop cumulativeMap referansına doğrudan ekler.
+  await runPaginationLoop({
+    fetchPage,
+    totalCount: expectedCount,
+    label,
+    checkpointKey,
+    cumulativeMap: masterMap,
+    onProgress,
+  });
+
+  // Beklenen sayıyla karşılaştır — eksik yoksa direkt dön
+  if (masterMap.size >= expectedCount || expectedCount === 0) {
+    return mapToArr(masterMap);
+  }
+
+  // İlk çekim sayısını kaydet (denge kontrolü için — Opt-4: sessionStorage IO kaldırıldı)
+  let lastFetchedCount = masterMap.size;
+
+  // Büyük Hesap Ölçeklendirmesi: expectedCount taramanın BAŞINDA alınan anlık bir
+  // görüntüdür. Büyük hesaplarda tek bir tam tur zaten dakikalar/saatler sürdüğünden,
+  // bu süre boyunca gerçekleşen organik takip/takipten-çıkma trafiği expectedCount'u
+  // taramanın kendisinden daha hızlı eskitir — 5 tam turu bu hareketli hedefe
+  // yakınsamayı ummak için tekrarlamak yakınsamaz, sadece süreyi katlar. Küçük/orta
+  // hesaplarda davranış AYNEN korunuyor (5 deneme + Denge Kontrolü).
+  const retryBudget =
+    expectedCount >= LARGE_ACCOUNT_THRESHOLD ? MAX_DEFICIT_RETRIES_LARGE_ACCOUNT : MAX_DEFICIT_RETRIES;
+
+  // ─── Tur 2+: Kümülatif Tamamlama Turları ───────────────────────────────
+  for (let retry = 1; retry <= retryBudget; retry++) {
+    const deficit = expectedCount - masterMap.size;
+    onProgress?.({
+      step: "repair",
+      message: `${label}: ${deficit} eksik hesap tespit edildi, tamamlanıyor... (${retry}/${retryBudget}. tur)`,
+      current: masterMap.size,
+      total: expectedCount,
+    });
+
+    // Anti-ban beklemesi (tek jitter: 1.5-3.5s — art arda iki bekleme otantiklik katmıyor,
+    // sadece gereksiz süre ekliyordu; tek duraklama zaten "insan" temposu için yeterli)
+    await humanDelay();
+
+    // Aynı masterMap referansıyla yeniden sayfalama — SİLMEDEN kümülatif ekler
+    await runPaginationLoop({
+      fetchPage,
+      totalCount: expectedCount,
+      label,
+      checkpointKey,
+      cumulativeMap: masterMap, // AYNI Map → No Wipe, kümülatif ekleme
+      onProgress,
+    });
+
+    const currentCount = masterMap.size;
+
+    onProgress?.({
+      step: "repair",
+      message: `${label}: ${retry}. tur tamamlandı — ${currentCount}/${expectedCount} hesap`,
+      current: currentCount,
+      total: expectedCount,
+    });
+
+    // ─── Akıllı Erken Çıkış: Hedef sayıya ulaşıldı ──────────────────────
+    if (currentCount >= expectedCount) {
+      console.log(
+        `[Kümülatif] ${label}: Hedef sayıya ulaşıldı (${currentCount}/${expectedCount}). BAŞARILI.`
+      );
+      return mapToArr(masterMap);
+    }
+
+    // ─── Denge Kontrolü (Delta = 0 Erken Çıkış) ─────────────────────────
+    // Bu turda YENİ kişi bulunamadıysa → "maks ulaşılabilir veri budur"
+    if (currentCount === lastFetchedCount) {
+      console.log(
+        `[Kümülatif] ${label}: Delta=0 (${currentCount}/${expectedCount}). ` +
+        `Denge noktasına ulaşıldı — dondurulmuş/kapalı hesaplar nedeniyle hedef sayıya ulaşılamıyor. BAŞARILI.`
+      );
+      onProgress?.({
+        step: "repair",
+        message: `${label}: Tüm ulaşılabilir hesaplar çekildi (${currentCount} kişi). ✓`,
+        current: currentCount,
+        total: expectedCount,
+      });
+      return mapToArr(masterMap);
+    }
+
+    // Sayı değişti — yeni değeri güncelle ve devam et (Opt-4: sessionStorage IO yok)
+    lastFetchedCount = currentCount;
+  }
+
+  // ─── Mutlak Limit: Tüm retry'lar tükendi ───────────────────────────────
+  console.log(
+    `[Kümülatif] ${label}: Maks retry (${retryBudget}) tükendi. ` +
+    `${masterMap.size}/${expectedCount} ile sonlandırılıyor. BAŞARILI.`
+  );
+  return mapToArr(masterMap);
+}
+
+
+// ─── Ana Analiz Orkestratörü ──────────────────────────────────────────────────
+
+/**
+ * Python'daki main() fonksiyonunun tam karşılığı:
+ *   1. get_user_id(target_username, headers) → user_id
+ *   2. fetch_followers(user_id, headers) → followers set
+ *   3. fetch_following(user_id, headers) → following set
+ *   4. compare_follow_lists(followers, following) → result
+ */
+export async function startAnalysis(
+  sessionId: string,
+  userId: string,
+  targetUsername: string,
+  email: string,
+  onProgress?: (p: AnalysisProgress) => void
+) {
+  // Aşama 4: Paralel tetikleme engeli
+  const locked = await acquireAnalysisLock("main");
+  if (!locked) {
+    throw new Error("ANALYSIS_ALREADY_RUNNING");
+  }
+
+  try {
+    // Adım 1: Profil bilgilerini al (Python: get_user_id + ek bilgi)
+    onProgress?.({ step: "precheck", message: "Hedef hesap bilgileri kontrol ediliyor..." });
+
+    const res = await fetch("/api/ig/get-profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: targetUsername, sessionId }),
+      signal: AbortSignal.timeout(CLIENT_TIMEOUT_MS),
+    });
+
+    if (!res.ok) {
+      throw new Error("Profil bilgisi alınamadı. Session veya hedef hesabı kontrol edin.");
+    }
+
+    const profile = await res.json();
+    const expectedFollowers = profile.followersCount ?? profile.expectedFollowers ?? 0;
+    const expectedFollowing = profile.followingCount ?? profile.expectedFollowing ?? 0;
+
+    await humanDelay();
+
+    // Adım 2: Takipçileri çek (Python: fetch_followers)
+    onProgress?.({
+      step: "fetching",
+      message: `Takipçi listesi indiriliyor... (0/${expectedFollowers} hesap)`,
+      current: 0,
+      total: expectedFollowers,
+    });
+
+    const followers = await runDeficitRetry({
+      fetchPage: (maxId) =>
+        callPaginatedApi("/api/ig/followers", { userId, sessionId, maxId }),
+      expectedCount: expectedFollowers,
+      label: "Takipçiler",
+      // DÜZELTME: sabit "followers" key'i hedef hesaba göre scope'lanmamıştı — hedef hesap
+      // değiştirilip önceki analiz checkpoint bırakacak şekilde kesilirse, yeni analiz eski
+      // hesabın checkpoint'ini "devam" diye yükleyip iki hesabın verisini karıştırabilirdi.
+      checkpointKey: `followers_${userId}`,
+      onProgress,
+    });
+
+    await humanDelay();
+
+    // Adım 3: Takip edilenleri çek (Python: fetch_following)
+    onProgress?.({
+      step: "fetching",
+      message: `Takip edilen listesi indiriliyor... (0/${expectedFollowing} hesap)`,
+      current: 0,
+      total: expectedFollowing,
+    });
+
+    const following = await runDeficitRetry({
+      fetchPage: (maxId) =>
+        callPaginatedApi("/api/ig/following", { userId, sessionId, maxId }),
+      expectedCount: expectedFollowing,
+      label: "Takip Edilenler",
+      checkpointKey: `following_${userId}`,
+      onProgress,
+    });
+
+    // Adım 4: Hash Map analizi (Python: compare_follow_lists)
+    onProgress?.({ step: "analyzing", message: "Takipçi listeleri karşılaştırılıyor..." });
+
+    const { notFollowers, unfollowing, stats } = runFullAnalysis(followers, following);
+
+    const now = new Date().toISOString();
+    const profileStats = {
+      followersCount: stats.dedupFollowers,
+      followingCount: stats.dedupFollowing,
+      expectedFollowers,
+      expectedFollowing,
+    };
+
+    const prefix = `${email}_${targetUsername}_`;
+    await saveAnalysisPayloadBatch({
+      [`${prefix}followers`]: followers,
+      [`${prefix}following`]: following,
+      [`${prefix}notfollowers`]: notFollowers,
+      [`${prefix}unfollowing`]: unfollowing,
+      [`${prefix}profileStats`]: profileStats,
+      [`${prefix}lastAnalysisAt`]: now,
+      [`${prefix}analysisComplete`]: true,
+    });
+
+    onProgress?.({
+      step: "complete",
+      message: "Analiz başarıyla tamamlandı! ✓",
+      current: followers.length + following.length,
+      total: followers.length + following.length,
+    });
+
+    return { followers, following, notFollowers, unfollowing, profileStats, lastAnalysisAt: now };
+  } finally {
+    // Aşama 4: Kilidi her durumda serbest bırak
+    await releaseAnalysisLock("main");
+  }
+}
+
+export async function loadStoredAnalysis(email: string, targetUsername: string): Promise<StoredAnalysis> {
+  const prefix = `${email}_${targetUsername}_`;
+  const [followers, following, notFollowers, unfollowing, profileStats, lastAnalysisAt] =
+    await Promise.all([
+      loadAnalysisPayload<IgUser[]>(`${prefix}followers`),
+      loadAnalysisPayload<IgUser[]>(`${prefix}following`),
+      loadAnalysisPayload<IgUser[]>(`${prefix}notfollowers`),
+      loadAnalysisPayload<IgUser[]>(`${prefix}unfollowing`),
+      loadAnalysisPayload<StoredAnalysis["profileStats"]>(`${prefix}profileStats`),
+      loadAnalysisPayload<string>(`${prefix}lastAnalysisAt`),
+    ]);
+
+  let resolvedNot = notFollowers ?? [];
+  let resolvedUnf = unfollowing ?? [];
+
+  // notFollowers ve unfollowing zaten kaydedilmişse yeniden hesaplama
+  // Sadece IDB'de eksik olduğunda (eski veri) recalculate et
+  if ((!notFollowers || !unfollowing) && followers?.length && following?.length) {
+    const fresh = runFullAnalysis(followers, following, { silent: true });
+    resolvedNot = fresh.notFollowers;
+    resolvedUnf = fresh.unfollowing;
+  }
+
+  return {
+    followers: followers ?? [],
+    following: following ?? [],
+    notFollowers: resolvedNot,
+    unfollowing: resolvedUnf,
+    lastAnalysisAt: lastAnalysisAt ?? null,
+    profileStats: profileStats ?? null,
+  };
+}
+
+// ─── Hayalet Takipçi (Ghost Followers) Orkestrasyon ───────────────────────────
+
+export type StoredGhostAnalysis = {
+  likers: IgUser[];
+  ghostFollowers: IgUser[];
+  secretAdmirers: IgUser[];
+  mediaId: string | null;
+  lastGhostAnalysisAt: string | null;
+};
+
+/**
+ * Ghost Followers analiz orkestratörü:
+ *   1. Son postu tespit et
+ *   2. Beğenenleri çek (deficit retry ile)
+ *   3. followers vs likers Hash Map karşılaştırması
+ *   4. IndexedDB'ye kaydet
+ */
+export async function startGhostAnalysis(
+  sessionId: string,
+  userId: string,
+  followers: IgUser[],
+  email: string,
+  targetUsername: string,
+  onProgress?: (p: AnalysisProgress) => void
+): Promise<{ likers: IgUser[]; ghostFollowers: IgUser[]; secretAdmirers: IgUser[]; mediaId: string }> {
+  // Aşama 4: Paralel tetikleme engeli
+  const locked = await acquireAnalysisLock("ghost");
+  if (!locked) {
+    throw new Error("ANALYSIS_ALREADY_RUNNING");
+  }
+
+  try {
+    // Adım 1: Son postu tespit et
+    onProgress?.({ step: "ghost-precheck", message: "Son gönderi aranıyor..." });
+
+    const mediaRes = await fetch("/api/ig/latest-media", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId, sessionId }),
+      signal: AbortSignal.timeout(CLIENT_TIMEOUT_MS),
+    });
+
+    if (!mediaRes.ok) {
+      const errData = await mediaRes.json().catch(() => ({}));
+      if (errData.code === "NO_POSTS") {
+        throw new Error("GHOST_NO_POSTS");
+      }
+      throw new Error("Son post bilgisi alınamadı.");
+    }
+
+    const mediaData = await mediaRes.json();
+    const mediaId = String(mediaData.mediaId);
+
+    await humanDelay();
+
+    // Adım 2: Beğenenleri çek
+    onProgress?.({
+      step: "fetching",
+      message: "Son gönderiye beğeni bırakanlar taranıyor...",
+      current: 0,
+      total: 0,
+    });
+
+    const likers = await runDeficitRetry({
+      fetchPage: (maxId) =>
+        callPaginatedApi("/api/ig/likers", { mediaId, sessionId, maxId }),
+      expectedCount: 0, // Likers için beklenen sayı bilinmiyor
+      label: "Beğenenler",
+      // DÜZELTME: mediaId'ye scope'landı — farklı bir post analiz edilirken önceki postun
+      // yarım kalmış likers checkpoint'i yanlışlıkla "devam" olarak yüklenmesin.
+      checkpointKey: `likers_${mediaId}`,
+      onProgress,
+    });
+
+    // Adım 3: Hash Map karşılaştırması
+    onProgress?.({ step: "analyzing", message: "Hayalet takipçiler tespit ediliyor..." });
+
+    const { ghostFollowers, secretAdmirers } = runGhostAnalysis(followers, likers);
+
+    // Adım 4: IndexedDB'ye kaydet
+    const now = new Date().toISOString();
+    const prefix = `${email}_${targetUsername}_`;
+    await saveAnalysisPayloadBatch({
+      [`${prefix}likers`]: likers,
+      [`${prefix}ghostFollowers`]: ghostFollowers,
+      [`${prefix}secretAdmirers`]: secretAdmirers,
+      [`${prefix}ghostMediaId`]: mediaId,
+      [`${prefix}lastGhostAnalysisAt`]: now,
+    });
+
+    return { likers, ghostFollowers, secretAdmirers, mediaId };
+  } finally {
+    // Aşama 4: Kilidi her durumda serbest bırak
+    await releaseAnalysisLock("ghost");
+  }
+}
+
+export async function loadStoredGhostAnalysis(email: string, targetUsername: string): Promise<StoredGhostAnalysis> {
+  const prefix = `${email}_${targetUsername}_`;
+  const [likers, ghostFollowers, secretAdmirers, mediaId, lastGhostAnalysisAt] =
+    await Promise.all([
+      loadAnalysisPayload<IgUser[]>(`${prefix}likers`),
+      loadAnalysisPayload<IgUser[]>(`${prefix}ghostFollowers`),
+      loadAnalysisPayload<IgUser[]>(`${prefix}secretAdmirers`),
+      loadAnalysisPayload<string>(`${prefix}ghostMediaId`),
+      loadAnalysisPayload<string>(`${prefix}lastGhostAnalysisAt`),
+    ]);
+
+  return {
+    likers: likers ?? [],
+    ghostFollowers: ghostFollowers ?? [],
+    secretAdmirers: secretAdmirers ?? [],
+    mediaId: mediaId ?? null,
+    lastGhostAnalysisAt: lastGhostAnalysisAt ?? null,
+  };
+}

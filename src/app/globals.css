@@ -1,0 +1,263 @@
+@import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap");
+
+/* ======================================
+   Tasarım Token'ları (CSS Custom Properties)
+   Beyaz & açık pembe renk paleti
+   ====================================== */
+@layer base {
+  :root {
+    --color-bg:        #fdf8f6;
+    --color-surface:   #ffffff;
+    --color-border:    #f3e8e2;
+    --color-pink-1:    #fce7f3;   /* tailwind pink-100 */
+    --color-pink-2:    #fbcfe8;   /* tailwind pink-200 */
+    --color-pink-3:    #f9a8d4;   /* tailwind pink-300 */
+    --color-pink-4:    #ec4899;   /* tailwind pink-500 — aksan */
+    --color-pink-5:    #be185d;   /* tailwind pink-700 — hover */
+    --color-rose:      #fb7185;   /* tailwind rose-400 */
+    --color-text-primary:   #1a1a2e;
+    --color-text-secondary: #6b7280;
+    --color-text-muted:     #9ca3af;
+
+    --shadow-card: 0 4px 24px -4px rgba(236, 72, 153, 0.12),
+                   0 1px 4px -1px rgba(0,0,0,0.06);
+    --shadow-card-hover: 0 8px 40px -6px rgba(236, 72, 153, 0.22),
+                         0 2px 8px -2px rgba(0,0,0,0.08);
+    --shadow-btn: 0 4px 20px rgba(236, 72, 153, 0.35);
+    --shadow-btn-hover: 0 8px 28px rgba(236, 72, 153, 0.50);
+  }
+
+  html {
+    font-family: "Inter", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-text-primary);
+    margin: 0;
+    padding: 0;
+  }
+
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+}
+
+/* ======================================
+   Animasyon Keyframe'leri
+   ====================================== */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(28px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes floatY {
+  0%, 100% { transform: translateY(0px);  }
+  50%       { transform: translateY(-10px); }
+}
+
+@keyframes pulseRing {
+  0%   { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(236,72,153,0.4); }
+  70%  { transform: scale(1);    box-shadow: 0 0 0 16px rgba(236,72,153,0);  }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(236,72,153,0);    }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% center; }
+  100% { background-position:  200% center; }
+}
+
+/* ======================================
+   Yardımcı Animasyon Sınıfları
+   ====================================== */
+.anim-fade-in {
+  animation: fadeIn 0.7s ease both;
+}
+.anim-fade-up {
+  animation: fadeInUp 0.75s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.anim-delay-1 { animation-delay: 0.12s; }
+.anim-delay-2 { animation-delay: 0.24s; }
+.anim-delay-3 { animation-delay: 0.36s; }
+.anim-delay-4 { animation-delay: 0.48s; }
+.anim-delay-5 { animation-delay: 0.60s; }
+
+.float-anim {
+  animation: floatY 4s ease-in-out infinite;
+}
+
+/* ======================================
+   Özel Bileşen Stilleri
+   ====================================== */
+
+/* Gradient metin efekti */
+.gradient-text {
+  background: linear-gradient(135deg, #ec4899 0%, #f43f5e 50%, #a855f7 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Ana CTA butonu */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 18px 44px;
+  background: linear-gradient(135deg, #ec4899, #f43f5e);
+  color: #fff;
+  font-weight: 600;
+  font-size: 1rem;
+  letter-spacing: 0.01em;
+  border-radius: 50px;
+  border: none;
+  cursor: pointer;
+  text-decoration: none;
+  box-shadow: var(--shadow-btn);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+  white-space: nowrap;
+}
+.btn-primary:hover {
+  transform: translateY(-3px) scale(1.02);
+  box-shadow: var(--shadow-btn-hover);
+  background: linear-gradient(135deg, #db2777, #e11d48);
+}
+.btn-primary:active {
+  transform: translateY(0) scale(0.99);
+}
+
+/* Özellik kartları */
+/* Dashboard içerik alanı.
+   Genişlik JS state'i yerine medya sorgusuyla belirleniyor: ilk boyama doğru olur,
+   gezinmede layout kayması ve 300ms'lik geçiş animasyonu yaşanmaz. */
+.dashboard-content {
+  flex: 1;
+  margin-left: 260px;
+  width: calc(100% - 260px);
+  min-width: 0;
+}
+
+@media (max-width: 767px) {
+  .dashboard-content {
+    margin-left: 0;
+    width: 100%;
+  }
+}
+
+.feature-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 20px;
+  padding: 32px 28px;
+  box-shadow: var(--shadow-card);
+  transition: transform 0.3s ease, box-shadow 0.3s ease, border-color 0.3s ease;
+  position: relative;
+  overflow: hidden;
+}
+.feature-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(252,231,243,0.6) 0%, transparent 60%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+  z-index: 0;
+}
+.feature-card > * {
+  position: relative;
+  z-index: 1;
+}
+.feature-card:hover {
+  transform: translateY(-6px);
+  box-shadow: var(--shadow-card-hover);
+  border-color: var(--color-pink-2);
+}
+.feature-card:hover::before {
+  opacity: 1;
+}
+
+/* İkon badge'i */
+.icon-badge {
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  margin-bottom: 20px;
+  position: relative;
+  z-index: 1;
+}
+
+/* Arka plan dekoratif blob'lar */
+.bg-blob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Pulse ring — CTA butonu etrafı */
+.pulse-ring {
+  animation: pulseRing 2.4s ease-in-out infinite;
+}
+
+/* Shimmer badge */
+.shimmer-badge {
+  background: linear-gradient(
+    90deg,
+    #fce7f3 25%,
+    #fbcfe8 50%,
+    #fce7f3 75%
+  );
+  background-size: 200% auto;
+  animation: shimmer 2.4s linear infinite;
+}
+
+/* Sayı vurgulama */
+.stat-number {
+  font-size: 2.25rem;
+  font-weight: 800;
+  line-height: 1;
+  background: linear-gradient(135deg, #ec4899, #f43f5e);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Mobil menü ve genel layout yardımcıları */
+.container-xl {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* Scroll-reveal için (JS intersection observer kullanacağız) */
+.reveal {
+  opacity: 0;
+  transform: translateY(24px);
+  transition: opacity 0.65s cubic-bezier(0.22,1,0.36,1),
+              transform 0.65s cubic-bezier(0.22,1,0.36,1);
+}
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}

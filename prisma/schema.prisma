@@ -1,0 +1,77 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                  String   @id @default(cuid())
+  email               String   @unique
+  passwordHash        String
+  isVerified          Boolean  @default(false)
+  verificationToken   String?
+  verificationExpires DateTime?
+  displayId           String   @unique
+  followerTokens      Int      @default(0)
+  hasUsedFreeAnalysis Boolean  @default(false)
+  role                String   @default("user")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  passwordResets PasswordReset[]
+  usageLogs      UsageLog[]
+  purchases      Purchase[]
+
+  @@index([verificationToken])
+}
+
+// OTP akışı:
+// 1. forgot-password → otp + expiresAt oluşturulur
+// 2. verify-otp → otp doğrulanır, used=true, resetToken + resetTokenExpires oluşturulur
+// 3. reset-password → resetToken doğrulanır, şifre güncellenir, resetTokenUsed=true
+model PasswordReset {
+  id                 String    @id @default(cuid())
+  userId             String
+  otp                String
+  expiresAt          DateTime
+  used               Boolean   @default(false)   // OTP kullanıldı mı?
+  resetToken         String?                      // verify-otp sonrası üretilen geçici token
+  resetTokenExpires  DateTime?                    // Geçici token ne zamana kadar geçerli?
+  resetTokenUsed     Boolean   @default(false)   // Geçici token kullanıldı mı?
+  createdAt          DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, used])
+  @@index([otp])
+  @@index([resetToken])
+}
+
+model UsageLog {
+  id     String   @id @default(cuid())
+  userId String
+  type   String   // "analysis"
+  usedAt DateTime @default(now())
+  user   User     @relation(fields: [userId], references: [id])
+  @@index([userId, usedAt])
+}
+
+model Purchase {
+  id        String   @id @default(cuid())
+  userId    String
+  amount    Int
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+}
+
+model WatcherAccount {
+  id            String   @id @default(cuid())
+  username      String   @unique
+  cooldownUntil DateTime
+  updatedAt     DateTime @updatedAt
+}
