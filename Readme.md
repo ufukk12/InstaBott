@@ -1,0 +1,1 @@
+Bu proje , kullanıcının hesabını farklı bir gözcü hesabı yardımıyla analiz edip takip etmeyenlerini gösteren tarayıcı tabanlı veri depolamalı bir analiş sitesidir. (ilgilenenler için mail otp çalışmayabilir iletişime geçiniz...)
